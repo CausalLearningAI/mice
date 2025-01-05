@@ -1,6 +1,6 @@
 # ISTAnt
 
-Prediction-powered causal inference on high-dimensional data pipeline for automatic treatment effect estimation, with a specific showcase on a new ecological dataset, [ISTAnt](https://doi.org/10.6084/m9.figshare.26484934.v2), to study social immunity in ant colonies.
+Prediction-powered causal inference on high-dimensional data pipeline for automatic treatment effect estimation, with a specific showcase on a new ecological dataset, [ISTAnt](https://doi.org/10.6084/m9.figshare.26484934.v2) (including pre-processing), to study social immunity in ant colonies. 
 
 ## Get started
 
