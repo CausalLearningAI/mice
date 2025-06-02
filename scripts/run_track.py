@@ -5,6 +5,8 @@ from scipy.spatial.distance import cdist
 
 import argparse
 import os
+import time
+from utils import get_time
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Track ants in a video.")
@@ -138,11 +140,14 @@ def main(args):
         if args.verbose: print("No video files found in the specified directory.")
         return
     # create output directories
-    os.makedirs(os.path.join(args.data_dir, "tracking", "video"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "preview"), exist_ok=True)
     os.makedirs(os.path.join(args.data_dir, "tracking", "position"), exist_ok=True)
-    os.makedirs(os.path.join(args.data_dir, "tracking", "blue"), exist_ok=True)
-    os.makedirs(os.path.join(args.data_dir, "tracking", "yellow"), exist_ok=True)
-    os.makedirs(os.path.join(args.data_dir, "tracking", "focal"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "background", "blue"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "background", "yellow"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "background", "focal"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "nobackground", "blue"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "nobackground", "yellow"), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, "tracking", "nobackground", "focal"), exist_ok=True)
     if "v1" in args.data_dir:
         quantile = 0.99
     elif "v2" in args.data_dir:
@@ -150,32 +155,44 @@ def main(args):
     else:
         raise ValueError(f"Unknown data directory: {args.data_dir}. Please specify a valid dataset (v1 or v2).")
     for video_file in video_files:
-        print(f"Processing video: {video_file}")
+        print(f"Processing video: {video_file}", flush=True)
         video_path = os.path.join(video_dir, video_file)
         background = get_background(video_path, quantile, n=20)
         cap = cv2.VideoCapture(video_path)
 
         # === Setup VideoWriter ===
-        tracking_video_path = os.path.join(args.data_dir, "tracking", "video", video_file[:-4]+".mp4")
+        tracking_video_path = os.path.join(args.data_dir, "tracking", "preview", video_file[:-4]+".mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         tracking = cv2.VideoWriter(tracking_video_path, fourcc, fps, (width, height))
 
-        # === Setup Zoom Blue VideoWriter ===
-        zoom_blue_video_path = os.path.join(args.data_dir, "tracking", "blue", video_file[:-4]+".mp4")
         width = 2 * args.radius
         height = 2 * args.radius
-        zoom_blue = cv2.VideoWriter(zoom_blue_video_path, fourcc, fps, (width, height))
+        # === Setup Zoom Blue Background VideoWriter ===
+        zoom_blue_b_video_path = os.path.join(args.data_dir, "tracking", "background", "blue", video_file[:-4]+".mp4")
+        zoom_blue_b = cv2.VideoWriter(zoom_blue_b_video_path, fourcc, fps, (width, height))
 
-        # === Setup Zoom yellow VideoWriter ===
-        zoom_yellow_video_path = os.path.join(args.data_dir, "tracking", "yellow", video_file[:-4]+".mp4")
-        zoom_yellow = cv2.VideoWriter(zoom_yellow_video_path, fourcc, fps, (width, height))
+        # === Setup Zoom Yellow Background VideoWriter ===
+        zoom_yellow_b_video_path = os.path.join(args.data_dir, "tracking", "background", "yellow", video_file[:-4]+".mp4")
+        zoom_yellow_b = cv2.VideoWriter(zoom_yellow_b_video_path, fourcc, fps, (width, height))
 
-        # === Setup Zoom Focal VideoWriter ===
-        zoom_focal_video_path = os.path.join(args.data_dir, "tracking", "focal", video_file[:-4]+".mp4")
-        zoom_focal = cv2.VideoWriter(zoom_focal_video_path, fourcc, fps, (width, height))
+        # === Setup Zoom Focal Background VideoWriter ===
+        zoom_focal_b_video_path = os.path.join(args.data_dir, "tracking", "background", "focal", video_file[:-4]+".mp4")
+        zoom_focal_b = cv2.VideoWriter(zoom_focal_b_video_path, fourcc, fps, (width, height))
+
+        # === Setup Zoom Blue No Background VideoWriter ===
+        zoom_blue_nb_video_path = os.path.join(args.data_dir, "tracking", "nobackground", "blue", video_file[:-4]+".mp4")
+        zoom_blue_nb = cv2.VideoWriter(zoom_blue_nb_video_path, fourcc, fps, (width, height))
+
+        # === Setup Zoom Yellow No Background VideoWriter ===
+        zoom_yellow_nb_video_path = os.path.join(args.data_dir, "tracking", "nobackground", "yellow", video_file[:-4]+".mp4")
+        zoom_yellow_nb = cv2.VideoWriter(zoom_yellow_nb_video_path, fourcc, fps, (width, height))
+
+        # === Setup Zoom Focal No Background VideoWriter ===
+        zoom_focal_nb_video_path = os.path.join(args.data_dir, "tracking", "nobackground", "focal", video_file[:-4]+".mp4")
+        zoom_focal_nb = cv2.VideoWriter(zoom_focal_nb_video_path, fourcc, fps, (width, height))
 
         # Initialize tracking variables
         tracked_data = []
@@ -204,6 +221,7 @@ def main(args):
 
             # 0. Subtract the background from the current frame
             frame_noback = cv2.absdiff(frame, background)
+            frame_tracking = frame.copy()
 
             # Inizialization
             if frame_num == 0:
@@ -217,7 +235,7 @@ def main(args):
                 missing_blue = 1
             if yellow_centroid_new is None:
                 missing_yellow = 1
-            if args.verbose: print(f"Frame {frame_num} (new): Blue: {blue_centroid_new}, Yellow: {yellow_centroid_new}")
+            if args.verbose: print(f"Frame {frame_num} (new): Blue: {blue_centroid_new}, Yellow: {yellow_centroid_new}", flush=True)
             if blue_centroid_new and cdist([blue_centroid_new], [blue_centroid])[0][0] < args.max_step:
                 blue_centroid = blue_centroid_new
             else:
@@ -227,7 +245,7 @@ def main(args):
                 yellow_centroid = yellow_centroid_new
             else:
                 yellow_centroid = ants_centroids[yellow_index]
-            if args.verbose: print(f"Frame {frame_num}: Blue: {blue_centroid}, Yellow: {yellow_centroid}")
+            if args.verbose: print(f"Frame {frame_num}: Blue: {blue_centroid}, Yellow: {yellow_centroid}", flush=True)
             
             # 2. Get ants positions
             Y2F, B2F = 0, 0
@@ -244,9 +262,9 @@ def main(args):
                     cy = int(M["m01"] / M["m00"])
                     centroids.append((cx, cy))
             ants_centroids_new = merge_close_centroids(centroids)
-            if args.verbose: print(f"Frame {frame_num}: Ants centroids (new): {ants_centroids_new}")
+            if args.verbose: print(f"Frame {frame_num}: Ants centroids (new): {ants_centroids_new}", flush=True)
             if len(ants_centroids_new)<1:
-                print("Not ants detect.")
+                print("Not ants detect.", flush=True)
             elif len(ants_centroids_new)==1:
                 Y2F, B2F = 1, 1
             elif len(ants_centroids_new)==2:
@@ -262,12 +280,12 @@ def main(args):
                 ants_centroids = ants_centroids_new[:3]
 
             # 3. Identify ants
-            if args.verbose: print(f"Frame {frame_num}: Ants centroids: {ants_centroids}")
+            if args.verbose: print(f"Frame {frame_num}: Ants centroids: {ants_centroids}", flush=True)
             blue_distances = cdist([blue_centroid], ants_centroids)
-            if args.verbose: print(f"Frame {frame_num}: Blue distances: {blue_distances}")
+            if args.verbose: print(f"Frame {frame_num}: Blue distances: {blue_distances}", flush=True)
             blue_index = np.argmin(blue_distances)
             yellow_distances = cdist([yellow_centroid], ants_centroids)
-            if args.verbose: print(f"Frame {frame_num}: Yellow distances: {yellow_distances}")
+            if args.verbose: print(f"Frame {frame_num}: Yellow distances: {yellow_distances}", flush=True)
             yellow_index = np.argmin(yellow_distances)
             if blue_index == yellow_index:
                 if blue_distances[0][blue_index] < yellow_distances[0][yellow_index]:
@@ -301,43 +319,56 @@ def main(args):
             })
             
             # Color marking
-            cv2.circle(frame, (int(blue_centroid[0]), int(blue_centroid[1])), 5, color_map["skyblue"], -1)
-            cv2.circle(frame, (int(yellow_centroid[0]), int(yellow_centroid[1])), 5, color_map["orange"], -1)
+            cv2.circle(frame_tracking, (int(blue_centroid[0]), int(blue_centroid[1])), 5, color_map["skyblue"], -1)
+            cv2.circle(frame_tracking, (int(yellow_centroid[0]), int(yellow_centroid[1])), 5, color_map["orange"], -1)
             for color, index in zip(["blue", "yellow", "green"], [blue_index, yellow_index, focal_index]):
-                cv2.circle(frame, (int(ants_centroids[index][0]), int(ants_centroids[index][1])), 5, color_map[color], -1)
-            cv2.arrowedLine(frame, 
+                cv2.circle(frame_tracking, (int(ants_centroids[index][0]), int(ants_centroids[index][1])), 5, color_map[color], -1)
+            cv2.arrowedLine(frame_tracking, 
                             (int(blue_x), int(blue_y)), 
                             (int(blue_x + 10 * (blue_x - blue_x_old)), int(blue_y + 10 * (blue_y - blue_y_old))), 
                             color_map["blue"], 2)
-            cv2.arrowedLine(frame, 
+            cv2.arrowedLine(frame_tracking, 
                             (int(yellow_x), int(yellow_y)), 
                             (int(yellow_x + 10 * (yellow_x - yellow_x_old)), int(yellow_y + 10 * (yellow_y - yellow_y_old))), 
                             color_map["yellow"], 2)
-            cv2.arrowedLine(frame, 
+            cv2.arrowedLine(frame_tracking, 
                             (int(focal_x), int(focal_y)), 
                             (int(focal_x + 10 * (focal_x - focal_x_old)), int(focal_y + 10 * (focal_y - focal_y_old))), 
                             color_map["green"], 2)
             
+            blue_x_old, blue_y_old = blue_x, blue_y
+            yellow_x_old, yellow_y_old = yellow_x, yellow_y
+            focal_x_old, focal_y_old = focal_x, focal_y
+            
             # Write the frame to the output video
-            tracking.write(frame)
-            zoom_blue.write(zoom(frame, ants_centroids[blue_index], args.radius))
-            zoom_yellow.write(zoom(frame, ants_centroids[yellow_index], args.radius))
-            zoom_focal.write(zoom(frame, ants_centroids[focal_index], args.radius))
+            tracking.write(frame_tracking)
+            zoom_blue_b.write(zoom(frame, ants_centroids[blue_index], args.radius))
+            zoom_yellow_b.write(zoom(frame, ants_centroids[yellow_index], args.radius))
+            zoom_focal_b.write(zoom(frame, ants_centroids[focal_index], args.radius))
+            zoom_blue_nb.write(zoom(frame_noback, ants_centroids[blue_index], args.radius))
+            zoom_yellow_nb.write(zoom(frame_noback, ants_centroids[yellow_index], args.radius))
+            zoom_focal_nb.write(zoom(frame_noback, ants_centroids[focal_index], args.radius))
 
             frame_num += 1
 
         # Release resources
         cap.release()
         tracking.release()
-        zoom_blue.release()
-        zoom_yellow.release()
-        zoom_focal.release()
+        zoom_blue_b.release()
+        zoom_yellow_b.release()
+        zoom_focal_b.release()
+        zoom_blue_nb.release()
+        zoom_yellow_nb.release()
+        zoom_focal_nb.release()
 
         # Save tracking data to CSV
         df = pd.DataFrame(tracked_data)
         df.to_csv(os.path.join(args.data_dir, "tracking", "position", f"{video_file[:-4]}.csv"), index=False)
-        print("Tracking saved to tracking.csv")
+        print("Tracking saved to tracking.csv", flush=True)
 
 if __name__ == "__main__":
     args = get_parser().parse_args()
+    start_time = time.time()
     main(args)
+    get_time(start_time)
+
