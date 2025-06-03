@@ -39,11 +39,9 @@ def get_embeddings(data, encoder_name, batch_size=100, num_proc=4, data_dir="./d
     if token in ["class", "mean"]:
         data_emb_dir = os.path.join(data_dir, "embeddings", token, encoder_name)
         if os.path.exists(data_emb_dir):
-            environments = [f.name for f in os.scandir(data_emb_dir) if f.is_dir()]
-            if (data.environment in environments):
-                if verbose: print(f"Embeddings from encoder '{encoder_name}' token '{token}' already extracted for the {data.environment} environment.")
-                data_emb_env_dir = os.path.join(data_emb_dir, data.environment)
-                embeddings = Dataset.load_from_disk(data_emb_env_dir)
+            if len(os.listdir(data_emb_dir))>0:
+                if verbose: print(f"Embeddings for '{data_dir}', encoder '{encoder_name}', token '{token}' already extracted.")
+                embeddings = Dataset.load_from_disk(data_emb_dir)
                 X = embeddings[encoder_name]
                 X.encoder_name = encoder_name
                 X.token = token
@@ -70,9 +68,8 @@ def get_embeddings(data, encoder_name, batch_size=100, num_proc=4, data_dir="./d
         embeddings = torch.cat(embeddings, 0)
         embeddings = Dataset.from_dict({encoder_name: embeddings.tolist()})
         embeddings.set_format(type="torch", columns=[encoder_name])
-        data_emb_env_dir = os.path.join(data_emb_dir, data.environment)
-        embeddings.save_to_disk(data_emb_env_dir)
-        if verbose: print(f"Embeddings from encoder '{encoder_name}' token '{token}' computed and saved correctly for the {data.environment} environment..")
+        embeddings.save_to_disk(data_emb_dir)
+        if verbose: print(f"Embeddings from encoder '{encoder_name}' token '{token}' computed and saved correctly.")
         X = embeddings[encoder_name]
         X.encoder_name = encoder_name
         X.token = token
@@ -104,7 +101,7 @@ def encoder(x, model, processor, device, token="class"):
     return emb.to("cpu")
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_nodes, hidden_layers, task):
+    def __init__(self, input_size, hidden_nodes, hidden_layers, task, psi_dim=16):
         super().__init__()
         self.task = task
         if task=="all":
@@ -114,16 +111,25 @@ class MLP(nn.Module):
         else:
             output_size = 1
         self.output_size = output_size
+        self.psi_dim = psi_dim
 
+        # featurizer
+        self.featurizer = nn.Sequential(
+            nn.Linear(input_size-psi_dim, 100),
+            nn.ReLU(),
+            nn.Linear(100, psi_dim),
+            nn.ReLU()
+        )
+        # head
         layers = []
+        layers.append(nn.Linear(2*psi_dim, psi_dim))
+        layers.append(nn.ReLU())
         for _ in range(hidden_layers):
-            layers.append(nn.Linear(input_size, input_size))
+            layers.append(nn.Linear(psi_dim, psi_dim))
             layers.append(nn.ReLU())
-        self.featurizer = nn.Sequential(*layers)
-        self.head = nn.Sequential(nn.Linear(input_size, hidden_nodes), 
-                             nn.ReLU(), 
-                             nn.Linear(hidden_nodes, output_size))
-        self.model = nn.Sequential(self.featurizer, self.head)
+        layers.append(nn.Linear(psi_dim, output_size))
+        self.head = nn.Sequential(*layers)
+
         self.init_weights() # check if works
         
     def init_weights(self):
@@ -133,7 +139,10 @@ class MLP(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
     def forward(self, X):
-        self.representation = self.featurizer(X)
+        frame_emb = X[:, :-self.psi_dim] 
+        track = X[:, -self.psi_dim:] 
+        self.representation = torch.cat((self.featurizer(frame_emb), track), 
+                                   dim=-1) 
         return self.head(self.representation) # [-1.8, 0.4]
     
     def probs(self, X):
@@ -153,22 +162,3 @@ class MLP(nn.Module):
             return torch.matmul(probs, values) # [0.5]
         else:
             return self.probs(X) # [0.8, 0.4]
-
-class ContrastiveLossCosine(nn.Module):
-    def __init__(self, margin=0.5):
-        super(ContrastiveLossCosine, self).__init__()
-        self.margin = margin
-
-    def forward(self, embedding1, embedding2, label):
-        # Calculate the cosine similarity between the two embeddings
-        cosine_similarity = nn.functional.cosine_similarity(embedding1, embedding2)
-        # Transform cosine similarity to cosine distance
-        cosine_distance = 1 - cosine_similarity
-        # Calculate the contrastive loss
-        loss = torch.mean(
-            (1 - label) * torch.pow(cosine_distance, 2) +
-            label * torch.pow(torch.clamp(cosine_distance - self.margin, min=0.0), 2)
-        )
-        
-        return loss     
-    
