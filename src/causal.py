@@ -88,7 +88,7 @@ class AIPW:
         mu1 = self.model_outcome.predict(torch.cat((X, torch.ones(N, 1)), dim=1))
         ps = self.model_propensity.predict_proba(X)[:, 1]
         self.ite = mu1-mu0 + T.numpy() * (Y.numpy()-mu1) / (ps) - (1-T.numpy()) * (Y.numpy()-mu0) / (1-ps) 
-        #self.ate = ite.mean().item()
+        self.ate = self.ite.mean().item()
 
     def effect(self, _):
         return self.ite

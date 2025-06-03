@@ -1,20 +1,35 @@
 import torch
 import pandas as pd
 import numpy as np
+import numpy as np
 import random
 import matplotlib.pyplot as plt
 import cv2
 import os
-
 from datasets import Dataset
+
 from model import get_embeddings, MLP
 from train import train_, train_md
 from visualize import plot_outcome_distribution
-from utils import get_metric, set_seed, check_folder
-from causal import compute_ate
+from utils import set_seed, check_folder, accuracy, AIPW
 
 class PPCI():
-    def __init__(self, task="all", encoder="dino", token="class", split_criteria="experiment", reduce_fps_factor=15, downscale_factor=1, batch_size=100, num_proc=4, environment="all", generate=False, data_dir="./data/istant_lq", results_dir="./results/istant_lq", verbose=False):
+    def __init__(self, 
+                task="all", 
+                encoder="dino", 
+                token="class", 
+                split_criteria="experiment", 
+                reduce_fps_factor=15, 
+                downscale_factor=1, 
+                batch_size=100, 
+                num_proc=4, 
+                environment="all", 
+                generate=False, 
+                data_dir="./data/v2", 
+                results_dir="./results/v2", 
+                background=False,
+                verbose=False):
+        
         # TODO: check generate option
         if environment in ["all", "supervised"]:
             self.supervised = load_env("supervised", 
@@ -28,6 +43,7 @@ class PPCI():
                                     num_proc=num_proc,
                                     generate=generate,
                                     data_dir=data_dir,
+                                    background=background,
                                     verbose=verbose)
             self.n_supervised = self.supervised["T"].shape[0]
         if environment in ["all", "unsupervised"]:
@@ -42,6 +58,7 @@ class PPCI():
                                     num_proc=num_proc,
                                     generate=generate,
                                     data_dir=data_dir,
+                                    background=background,
                                     verbose=verbose)
             self.n_unsupervised = self.unsupervised["T"].shape[0]
         self.task = task
@@ -52,38 +69,49 @@ class PPCI():
         self.results_dir = results_dir
         if verbose: print("Prediction-Powered Causal Inference dataset successfully loaded.")
     
-    def train(self, batch_size=256, num_epochs=10, lr=0.001, hidden_nodes=256, hidden_layers=2, verbose=True, add_pred_env="supervised", seed=0, save=False, force=False, multidomain=False, ic_weight=1):
-        # TODO: check saving options
+    def train(self, batch_size=256, num_epochs=10, lr=0.001, hidden_nodes=256, hidden_layers=2, verbose=True, add_pred_env="supervised", seed=0, save=False, force=False, method="ERM", ic_weight=10, gpu=True, cfl=0):
         set_seed(seed)
-        # model_path = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed), "model.pth")
-        # if os.path.exists(model_path) and not force:
-        #     if verbose: print("Model already trained.")
-        #     self.model = MLP(self.supervised["X"].shape[1], hidden_nodes, hidden_layers, task=self.supervised["Y"].task)
-        #     self.model.load_state_dict(torch.load(model_path))
-        #     self.model.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        #     self.model.to(self.model.device)
-        # else:
-        if multidomain:
-            self.model = train_md(self.supervised, 
-                                  batch_size=batch_size, 
-                                  num_epochs=num_epochs, 
-                                  lr=lr, 
-                                  hidden_nodes = hidden_nodes, 
-                                  hidden_layers = hidden_layers,
-                                  verbose=verbose,
-                                  ic_weight=ic_weight)
+        if method=='DERM' and self.task=="all":
+            raise ValueError("DERM method is not available (yet) for task 'all'.")
+        if not method in ["ERM", "vREx", "DERM", "IRM"]:
+            raise ValueError(f"Method '{method}' not defined. Please select between: 'ERM', 'vREx', 'DERM'.")
+        method_ = method if "ERM" in method else method+"_"+str(ic_weight)
+        model_path = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed), f"{method_}.pth")
+        if os.path.exists(model_path) and not force:
+            if verbose: print("Model already trained.")
+            self.model = MLP(self.supervised["X"].shape[1], hidden_nodes, hidden_layers, task=self.supervised["Y"].task)
+            self.model.device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
+            self.model.load_state_dict(torch.load(model_path, map_location=self.model.device, weights_only=True))
+            self.model.to(self.model.device)
         else:
-            self.model = train_(self.supervised, 
-                                batch_size=batch_size, 
-                                num_epochs=num_epochs, 
-                                lr=lr, 
-                                hidden_nodes = hidden_nodes, 
-                                hidden_layers = hidden_layers,
-                                verbose=verbose)
-            # if save:
-            #     model_dir = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed))
-            #     check_folder(model_dir)
-            #     torch.save(self.model.state_dict(), os.path.join(model_dir, "model.pth"))
+            if method in ["vREx", "IRM"]:
+                self.model = train_md(self.supervised, 
+                                    batch_size=batch_size, 
+                                    num_epochs=num_epochs, 
+                                    lr=lr, 
+                                    hidden_nodes = hidden_nodes, 
+                                    hidden_layers = hidden_layers,
+                                    verbose=verbose,
+                                    ic_weight=ic_weight,
+                                    method=method,
+                                    gpu=gpu,
+                                    cfl=cfl)
+            else:
+                self.model = train_(self.supervised, 
+                                    batch_size=batch_size, 
+                                    num_epochs=num_epochs, 
+                                    lr=lr, 
+                                    hidden_nodes = hidden_nodes, 
+                                    hidden_layers = hidden_layers,
+                                    verbose=verbose,
+                                    decondounded = method=="DERM",
+                                    gpu=gpu,
+                                    cfl=cfl)
+            if save:
+                method_ = method if "ERM" in method else method+"_"+str(ic_weight)
+                model_dir = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed))
+                check_folder(model_dir)
+                torch.save(self.model.state_dict(), os.path.join(model_dir, f"{method_}.pth"))
         if add_pred_env in ["supervised", "unsupervised"]:
             self.add_pred(add_pred_env)
         elif add_pred_env=="all":
@@ -104,86 +132,54 @@ class PPCI():
             device = self.model.device
             with torch.no_grad():
                 if environment=="supervised":
-                    self.supervised["Y_hat"] = self.model.cond_exp(self.supervised["X"].to(device)).to("cpu").squeeze()
+                    X = torch.cat((self.supervised["X"], self.supervised["psi_X"]), dim=1)
+                    self.supervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
                 elif environment=="unsupervised":
-                    self.unsupervised["Y_hat"] = self.model.cond_exp(self.unsupervised["X"].to(device)).to("cpu").squeeze()
+                    X = torch.cat((self.unsupervised["X"], self.unsupervised["psi_X"]), dim=1)
+                    self.unsupervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
                 elif environment=="all":
-                    self.supervised["Y_hat"] = self.model.cond_exp(self.supervised["X"].to(device)).to("cpu").squeeze()
-                    self.unsupervised["Y_hat"] = self.model.cond_exp(self.unsupervised["X"].to(device)).to("cpu").squeeze()
+                    X = torch.cat((self.supervised["X"], self.supervised["psi_X"]), dim=1)
+                    self.supervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
+                    X = torch.cat((self.unsupervised["X"], self.unsupervised["psi_X"]), dim=1)
+                    self.unsupervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
                 else:
                     raise ValueError(f"Environment '{environment}' not defined.")
         else:
             raise ValueError("Train the model first, before computing the inference step.")
     
-    def evaluate(self, color="blue", T_control=1, T_treatment=2, verbose=False, subsample_val=False):
-        # TODO: use ratio for subsample_val
+    def evaluate(self, color="blue", T_control=1, T_treatment=2, verbose=False):
         if "Y_hat" in self.supervised:
-            if self.task=="all":
-                if color=="yellow":
-                    Y = self.supervised["Y"][:,0]
-                    Y_hat = self.supervised["Y_hat"][:,0]
-                elif color=="blue":
-                    Y = self.supervised["Y"][:,1]
-                    Y_hat = self.supervised["Y_hat"][:,1]
-                else:
-                    raise ValueError(f"Invalid color '{color}', please select between: 'blue', 'yellow'.")
-            else:
-                Y = self.supervised["Y"]
-                Y_hat = self.supervised["Y_hat"]
-            color = "preselected"
-            W = self.supervised["W"]
-            T = self.supervised["T"]
-            E = self.supervised["E"]
-            split = self.supervised["split"]
-            if subsample_val:
-                n_val = 3600 # replace with ratio
-                set_seed(0)
-                idx = random.sample(range(0, (~split).sum()), n_val)
-            else:
-                idx = range(0, (~split).sum())
-            Y_val = Y[~split][idx]
-            Y_hat_val = Y_hat[~split][idx]
-            T_val = T[~split][idx]
-            W_val = W[~split][idx]
-            E_val = E[~split][idx]
-            
-            # validation
-            pos_weight = ((Y[split]==0).sum(dim=0)/(Y[split]==1).sum(dim=0))#.to(device)
-            loss_fn = torch.nn.BCELoss(weight=pos_weight)
-            loss_val = loss_fn(Y_hat_val, Y_val).item()
-            losses = []
-            for i in np.unique(E_val):
-                idx_i = E_val==i
-                loss_i = loss_fn(Y_hat_val[idx_i], Y_val[idx_i]).item()
-                losses.append(loss_i)
-            inv_loss_val = np.var(losses)
-            acc_val = get_metric(Y_val, Y_hat_val.round(), metric="accuracy")
-            bacc_val = get_metric(Y_val, Y_hat_val.round(), metric="balanced_acc")
-            TEB_val = compute_ate(Y_hat_val, T_val, W_val, method="ead", color=color, T_control=T_control, T_treatment=T_treatment) - compute_ate(Y_val, T_val, W_val, method="aipw", color=color, T_control=T_control, T_treatment=T_treatment)
-            # all
-            acc = get_metric(Y, Y_hat.round(), metric="accuracy")
-            bacc = get_metric(Y, Y_hat.round(), metric="balanced_acc")
-            EAD = compute_ate(Y, T, W, method="ead", color=color, T_control=T_control, T_treatment=T_treatment) 
-            TEB = compute_ate(Y_hat,T, W, method="ead", color=color, T_control=T_control, T_treatment=T_treatment) - EAD
-            TEB_bin = compute_ate(Y_hat.round(), T, W, method="ead", color=color, T_control=T_control, T_treatment=T_treatment) - EAD
- 
+            # stats
+            acc_train, bacc_train = accuracy(self, subset="train", color=color)
+            acc_val, bacc_val = accuracy(self, subset="val", color=color)
+            acc, bacc = accuracy(self, subset=None, color=color)
+            # causal
+            ATE_train, ATE_train_std, _ = AIPW(self, treatment=T_treatment, control=T_control, pred=False, color=color, subset="train")
+            PPATE_train, PPATE_train_std, _ = AIPW(self, treatment=T_treatment, control=T_control, pred=True, color=color, subset="train")
+            ATE, ATE_std, _ = AIPW(self, treatment=T_treatment, control=T_control, pred=False, color=color, subset=None)
+            PPATE, PPATE_std, _ = AIPW(self, treatment=T_treatment, control=T_control, pred=True, color=color, subset=None)
+      
             metric = {
-                "loss_val": loss_val,
-                "inv_loss_val": inv_loss_val,
+                "acc_train": acc_train,
+                "bacc_train": bacc_train,
                 "acc_val": acc_val,
                 "bacc_val": bacc_val,
-                "TEB_val": TEB_val,
                 "acc": acc,
                 "bacc": bacc,
-                "TEB": TEB,
-                "TEB_bin": TEB_bin,
-                "EAD": EAD,
+                "ATE_train": ATE_train,
+                "ATE_train_std": ATE_train_std,
+                "PPATE_train": PPATE_train,
+                "PPATE_train_std": PPATE_train_std,
+                "ATE": ATE,
+                "ATE_std": ATE_std,
+                "PPATE": PPATE,
+                "PPATE_std": PPATE_std,
             }
             if verbose: print(metric)
             return metric
         else:
-            raise ValueError("Train the model and predict the labels on the supervised dataset, before measuring the performances.")
-
+            raise ValueError("Train the model and predict the labels on the supervised dataset before measuring the performances.")
+    
     def get_examples(self, n, environment="supervised", validation=False):
         if environment=="supervised":
             if validation:
@@ -311,12 +307,21 @@ def get_outcome(dataset, task="all"):
     y.task = task
     return y
 
-def get_split(dataset, split_criteria="experiment"):
-    # TODO: clean
-    if split_criteria=="experiment":
+def get_split(dataset, split_criteria="random"):
+    if split_criteria=="all":
+        split = (dataset["experiment"] >= 0) # tr_ration: 1
+    elif split_criteria=="treatment0":
+        split = (dataset["treatment"] == 0) # tr_ration: 1/3
+    elif split_criteria=="treatment1":
+        split = (dataset["treatment"] == 1) # tr_ration: 1/3
+    elif split_criteria=="treatment2":
+        split = (dataset["treatment"] == 2) # tr_ration: 1/3
+    elif split_criteria=="experiment0" or split_criteria=="experiment":
         split = (dataset["experiment"] == 0) # tr_ration: 1/5
+    elif split_criteria=="experiment1":
+        split = (dataset["experiment"] == 1) # tr_ration: 1/5
     elif split_criteria=="experiment_easy":
-        split = (dataset["experiment"] != 4) # tr_ration: 4/5
+        split = (dataset["experiment"] != 3) # tr_ration: 4/5 # previously 4
     elif split_criteria=="position":
         split = (dataset["position"] == 1) # tr_ration: 1/9
     elif split_criteria=="position_easy":
@@ -347,41 +352,70 @@ def get_covariates(dataset):
     W = torch.cat([W, W_exp], dim=1)
     return W
 
-def load_env(environment='supervised', task="all", encoder="mae", token="class", split_criteria="experiment", generate=False, reduce_fps_factor=10, downscale_factor=1, batch_size=100, num_proc=4, data_dir="./data", verbose=False):
-    data_env_dir = os.path.join(data_dir, environment)
+def get_tracking(dataset):
+    tracking = dataset["tracking"]
+    if tracking is None:
+        raise ValueError("Tracking data not available in the dataset.")
+        # TODO: add script to generate tracking data if not available
+    if isinstance(tracking, torch.Tensor):
+        return tracking
+    else:
+        raise ValueError("Tracking data should be a PyTorch tensor.")
+
+def load_env(environment='supervised', task="all", encoder="dino", token="class", split_criteria="experiment", generate=False, reduce_fps_factor=10, downscale_factor=1, batch_size=100, num_proc=4, data_dir="./data", background=False, verbose=False):
+    data_env_dir = os.path.join(data_dir, environment, "background" if background else "nobackground")
     if not os.path.exists(data_env_dir):
         os.makedirs(data_env_dir)
         generate = True
-    if generate:
-        dataset = Dataset.from_generator(generator, gen_kwargs={"reduce_fps_factor": reduce_fps_factor, "downscale_factor": downscale_factor, "environment":environment, "data_dir":data_dir})
+    if not os.path.exists(os.path.join(data_env_dir, "state.json")):
+        generate = True
+    if generate:           
+        # features = datasets.Features({
+        #     "experiment": datasets.Value("int64"),
+        #     "position": datasets.Value("int64"),
+        #     "pos_x": datasets.Value("float32"),
+        #     "pos_y": datasets.Value("float32"),
+        #     "frame": datasets.Value("int64"),
+        #     "image": datasets.Sequence(datasets.Sequence(datasets.Sequence(datasets.Value("uint8")))),
+        #     "treatment": datasets.Value("int64"),
+        #     "outcome": datasets.Sequence(datasets.Value("float32")),
+        #     "exp_minute": datasets.Value("float32"),
+        #     "day_hour": datasets.Value("string"),
+        #     "tracking": datasets.Sequence(datasets.Value("float32")),
+        # })
+        dataset = Dataset.from_generator(generator, 
+                                         gen_kwargs={"reduce_fps_factor": reduce_fps_factor, "downscale_factor": downscale_factor, "environment":environment, "background":background, "data_dir":data_dir},
+                                         #features=features,
+                                         )
         dataset.save_to_disk(data_env_dir)
         if verbose: print("Data generated and saved correctly.")
     else:
         dataset = Dataset.load_from_disk(data_env_dir)
-    dataset.set_format(type="torch", columns=["image", "treatment", "outcome", 'pos_x', 'pos_y', 'exp_minute', 'day_hour', 'frame', "experiment", "position"], output_all_columns=True)
+    dataset.set_format(type="torch", columns=["image", "treatment", "outcome", 'pos_x', 'pos_y', 'exp_minute', 'day_hour', 'frame', "experiment", "position", "tracking"], output_all_columns=True)
     dataset.environment = environment
     W = get_covariates(dataset)
-    if 'istant' in data_dir:
+    if ('v1' in data_dir) or ('v2' in data_dir):
         exp_id = W[:, -5:] @ np.array([0,1,2,3,4])
         pos_id = W[:, 0] + 1 + 3*(W[:, 1] + 1)
-        E = (exp_id + 5*pos_id).to(torch.int64)
+        E = (9*exp_id + pos_id).to(torch.int64)
     else:
-        raise ValueError(f"Unknown 'enviornment' definition for dataset: {data_dir}")
+        raise ValueError(f"Unknown 'environment' definition for dataset: {data_env_dir}")
     dataset_dict = {
         "source_data": dataset,
-        "X": get_embeddings(dataset, encoder, batch_size=batch_size, num_proc=num_proc, data_dir=data_dir, token=token, verbose=verbose),
+        "X": get_embeddings(dataset, encoder, batch_size=batch_size, num_proc=num_proc, data_dir=data_env_dir, token=token, verbose=verbose),
         "Y": get_outcome(dataset, task=task),
+        "split": get_split(dataset, split_criteria=split_criteria),
         "W": W, 
         "E": E,
         "T": dataset["treatment"],
-        "split": get_split(dataset, split_criteria=split_criteria),
+        "psi_X": get_tracking(dataset),
     }
     if verbose: 
         print("Training Environments: ", np.unique(E[dataset_dict["split"]]))
         print("Validation Environments: ", np.unique(E[~dataset_dict["split"]]))
     return dataset_dict
 
-def generator(reduce_fps_factor, downscale_factor, environment='supervised', data_dir="./data"):
+def generator(reduce_fps_factor, downscale_factor, environment='supervised', background=False, data_dir="./data"):
     if environment == 'supervised':
         start_frame_column = 'Starting Frame'
         end_frame_column = 'End Frame Annotation'
@@ -398,8 +432,8 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', dat
             valid = int(settings[settings.Experiment == f'{exp}{pos}']["Valid"].values[0])
             if valid == 0:
                 continue
-            start_frame = int(settings[settings.Experiment == f'{exp}{pos}'][start_frame_column].values[0]/reduce_fps_factor)
-            end_frame = int(settings[settings.Experiment == f'{exp}{pos}'][end_frame_column].values[0]/reduce_fps_factor)
+            start_frame = int(settings[settings.Experiment == f'{exp}{pos}'][start_frame_column].values[0])
+            end_frame = int(settings[settings.Experiment == f'{exp}{pos}'][end_frame_column].values[0])
             if end_frame-start_frame<1:
                 continue
             treatment = settings[settings.Experiment == f'{exp}{pos}']['Treatment'].values[0].astype(int)
@@ -412,16 +446,30 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', dat
             frames = load_frames(exp, pos, 
                                  reduce_fps_factor=reduce_fps_factor, 
                                  downscale_factor=downscale_factor, 
-                                 start_frame=start_frame, 
-                                 end_frame=end_frame,
-                                 data_dir=data_dir)
+                                 start_frame=int(start_frame/reduce_fps_factor), 
+                                 end_frame=int(end_frame/reduce_fps_factor),
+                                 data_dir=data_dir,
+                                 background=background)
+            print(f"Frames shape: {len(frames)}", flush=True)
             # load annotations
             labels = load_labels(exp, pos, 
                                  reduce_fps_factor=reduce_fps_factor,
-                                 start_frame=start_frame,
-                                 end_frame=end_frame,
+                                 start_frame=int(start_frame/reduce_fps_factor),
+                                 end_frame=int(end_frame/reduce_fps_factor),
                                  data_dir=data_dir)
-            for i in range(end_frame-start_frame):
+            print(f"Labels shape: {labels.shape}", flush=True)
+            # load tracking data
+            tracking = load_tracking(exp, pos,
+                                    reduce_fps_factor=reduce_fps_factor, 
+                                    start_frame=start_frame, 
+                                    end_frame=end_frame,
+                                    data_dir=data_dir)
+            print(f"Tracking shape: {tracking.shape}", flush=True)
+            # print("Frames: ", len(frames))
+            # print("Labels: ", labels.shape)
+            # print("Start frame: ", start_frame)
+            # print("End frame: ", end_frame)
+            for i in range(int((end_frame-start_frame)/reduce_fps_factor)):
                 yield {
                     "experiment": id_exp,
                     'position': pos,                         
@@ -433,6 +481,7 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', dat
                     "outcome": labels[i,:],
                     "exp_minute": ((start_frame+i)/fps)//60, # covariate   
                     "day_hour": day_hour, # covariate   
+                    "tracking": tracking[i,:], 
                 }
 
 def map_behaviour_to_label(behaviour):
@@ -461,14 +510,23 @@ def load_labels(exp, pos, reduce_fps_factor, start_frame, end_frame, data_dir):
     if behaviors.shape[0]==0:
         return torch.zeros(end_frame-start_frame, 2, dtype=torch.float32)
     else:
-        labels = []
+        labels = [] # list of couples
         for i in range(start_frame, end_frame):
             labels.append(label_frame(i*reduce_fps_factor, behaviors))
-        return torch.tensor(labels, dtype=torch.float32)
+        return torch.tensor(labels, dtype=torch.float32) # tensor Nx2
+    
+def load_tracking(exp, pos, reduce_fps_factor, start_frame, end_frame, data_dir="./data"):
+    tracking_path = os.path.join(data_dir, f"tracking/position/{exp}{pos}.csv")
+    tracking = pd.read_csv(tracking_path, engine='python', index_col=0)
+    tracking_filtered = tracking.iloc[start_frame:end_frame:reduce_fps_factor, :]
+    return torch.tensor(tracking_filtered.values, dtype=torch.float32) # tensor Nx16
 
-def load_frames(exp, pos, reduce_fps_factor, downscale_factor, start_frame, end_frame, data_dir="./data"):
-    video_name = f'{exp}{pos}.mkv'
-    video_path = os.path.join(data_dir, "video", video_name)
+def load_frames(exp, pos, reduce_fps_factor, downscale_factor, start_frame, end_frame, data_dir="./data", background=False):
+    if background:
+        video_name = f'background/focal/{exp}{pos}.mp4'
+    else:
+        video_name = f'nobackground/focal/{exp}{pos}.mp4'
+    video_path = os.path.join(data_dir, "tracking", video_name)
     cap = cv2.VideoCapture(video_path)
     #original_fps = cap.get(cv2.CAP_PROP_FPS)
 
