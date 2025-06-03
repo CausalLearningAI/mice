@@ -7,7 +7,7 @@
 #
 #SBATCH --job-name=ants_track            # Job name
 #SBATCH --output=logs/ants_track_%j.log  # Output file
-#SBATCH --time=4:00:00                   # Maximum walltime
+#SBATCH --time=8:00:00                   # Maximum walltime
 #SBATCH --ntasks=1                       # Number of tasks
 #SBATCH --mem=10G                        # Memory allocation
 ##SBATCH --partition=gpu                  # Partition to use (e.g., gpu)
