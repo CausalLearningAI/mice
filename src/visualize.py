@@ -5,6 +5,7 @@ import matplotlib.colors as colors
 import matplotlib.gridspec as gridspec
 
 def plot_outcome_distribution(dataset, save=False, total=True, results_dir="./results"):
+    # TODO: fix with video-level statistics
     T = dataset['T']
     Y = dataset['Y']
     fig, axs = plt.subplots(1, 2+total, figsize=(12+6*total, 5))
@@ -53,6 +54,7 @@ def plot_outcome_distribution(dataset, save=False, total=True, results_dir="./re
         plt.show();
 
 def plot_error_all(df, model_name, results_dir):
+    # TODO: chek
     poss = np.arange(1, 10)  
     batchs = [0, 1, 2, 3, 4]
     metrics = ["Y", "Y_hat", "bias", "accuracy", "recall", "precision"]
