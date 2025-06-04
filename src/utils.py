@@ -199,3 +199,13 @@ def get_time(start_time):
     seconds = int(elapsed_time % 60)
     print(f"Elapsed time: {days} days, {hours} hours, {minutes} minutes, {seconds} seconds", flush=True)
     print(f"Current time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}", flush=True)
+
+def get_model_size(model):
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    total_size = param_size + buffer_size  # in bytes
+    return total_size / (1024 ** 2)  # convert to MB
