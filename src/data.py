@@ -8,7 +8,7 @@ import cv2
 import os
 from datasets import Dataset
 
-from model import get_embeddings, MLP
+from model import get_embeddings, get_classifier
 from train import train_, train_md
 from visualize import plot_outcome_distribution
 from utils import set_seed, check_folder, accuracy, AIPW
@@ -21,6 +21,8 @@ class PPCI():
                 split_criteria="experiment", 
                 reduce_fps_factor=15, 
                 downscale_factor=1, 
+                context=3,
+                stride=2,
                 batch_size=100, 
                 num_proc=4, 
                 environment="all", 
@@ -42,6 +44,8 @@ class PPCI():
                                     batch_size=batch_size, 
                                     num_proc=num_proc,
                                     generate=generate,
+                                    context=context,
+                                    stride=stride,
                                     data_dir=data_dir,
                                     background=background,
                                     verbose=verbose)
@@ -57,6 +61,8 @@ class PPCI():
                                     batch_size=batch_size, 
                                     num_proc=num_proc,
                                     generate=generate,
+                                    context=context,
+                                    stride=stride,
                                     data_dir=data_dir,
                                     background=background,
                                     verbose=verbose)
@@ -69,17 +75,18 @@ class PPCI():
         self.results_dir = results_dir
         if verbose: print("Prediction-Powered Causal Inference dataset successfully loaded.")
     
-    def train(self, batch_size=256, num_epochs=10, lr=0.001, hidden_nodes=256, hidden_layers=2, verbose=True, add_pred_env="supervised", seed=0, save=False, force=False, method="ERM", ic_weight=10, gpu=True, cfl=0):
+    def train(self, batch_size=256, num_epochs=10, lr=0.001, hidden_nodes=128, verbose=True, add_pred_env="supervised", seed=0, save=False, force=False, method="ERM", ic_weight=10, gpu=True, cfl=0, cls_name="Transformer"):
         set_seed(seed)
         if method=='DERM' and self.task=="all":
             raise ValueError("DERM method is not available (yet) for task 'all'.")
         if not method in ["ERM", "vREx", "DERM", "IRM"]:
             raise ValueError(f"Method '{method}' not defined. Please select between: 'ERM', 'vREx', 'DERM'.")
         method_ = method if "ERM" in method else method+"_"+str(ic_weight)
-        model_path = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed), f"{method_}.pth")
+        model_path = os.path.join(self.results_dir, "models", self.encoder, cls_name, self.token, self.split_criteria, self.task, str(lr), str(seed), f"{method_}.pth")
         if os.path.exists(model_path) and not force:
             if verbose: print("Model already trained.")
-            self.model = MLP(self.supervised["X"].shape[1], hidden_nodes, hidden_layers, task=self.supervised["Y"].task)
+            emb_size, num_frames = self.supervised["X"].shape[1], self.supervised["X"].shape[2]
+            self.model = get_classifier(cls_name, self.supervised["Y"].task, emb_size=emb_size, num_frames=num_frames, hidden_nodes=hidden_nodes, kernel_size=3)
             self.model.device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
             self.model.load_state_dict(torch.load(model_path, map_location=self.model.device, weights_only=True))
             self.model.to(self.model.device)
@@ -90,26 +97,26 @@ class PPCI():
                                     num_epochs=num_epochs, 
                                     lr=lr, 
                                     hidden_nodes = hidden_nodes, 
-                                    hidden_layers = hidden_layers,
                                     verbose=verbose,
                                     ic_weight=ic_weight,
                                     method=method,
                                     gpu=gpu,
-                                    cfl=cfl)
+                                    cfl=cfl,
+                                    cls_name=cls_name)
             else:
                 self.model = train_(self.supervised, 
                                     batch_size=batch_size, 
                                     num_epochs=num_epochs, 
                                     lr=lr, 
                                     hidden_nodes = hidden_nodes, 
-                                    hidden_layers = hidden_layers,
                                     verbose=verbose,
                                     decondounded = method=="DERM",
                                     gpu=gpu,
-                                    cfl=cfl)
+                                    cfl=cfl,
+                                    cls_name=cls_name)
             if save:
                 method_ = method if "ERM" in method else method+"_"+str(ic_weight)
-                model_dir = os.path.join(self.results_dir, "models", self.encoder, self.token, self.split_criteria, self.task, str(hidden_layers), str(lr), str(seed))
+                model_dir = os.path.join(self.results_dir, "models", cls_name, self.encoder, self.token, self.split_criteria, self.task, str(lr), str(seed))
                 check_folder(model_dir)
                 torch.save(self.model.state_dict(), os.path.join(model_dir, f"{method_}.pth"))
         if add_pred_env in ["supervised", "unsupervised"]:
@@ -121,27 +128,30 @@ class PPCI():
             raise ValueError(f"Invalid add_pred_env argument '{add_pred_env}', please select among: 'supervised', 'unsupervised', or 'all'.")
     
     def plot_out_distribution(self, save=True, total=True):
-        # TODO: check if works
+        # TODO: check if works/ update
         if self.task=="all":
             plot_outcome_distribution(self.supervised, save=save, total=total, results_dir=self.results_dir)
         else:
             raise ValueError("Plot available only for task: 'all'.")
 
-    def add_pred(self, environment="supervised"):
+    def add_pred(self, environment="supervised", max_batch_size=1000):
         if hasattr(self, 'model'):
             device = self.model.device
             with torch.no_grad():
                 if environment=="supervised":
-                    X = torch.cat((self.supervised["X"], self.supervised["psi_X"]), dim=1)
-                    self.supervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
+                    self.supervised["Y_hat"] = []
+                    for i in range(0, self.supervised["X"].shape[0], max_batch_size):
+                        batch_X = self.supervised["X"][i:i+max_batch_size].to(device)
+                        batch_Y_hat = self.model.cond_exp(batch_X).to("cpu").squeeze()
+                        self.supervised["Y_hat"].append(batch_Y_hat)
+                    self.supervised["Y_hat"] = torch.cat(self.supervised["Y_hat"], dim=0)
                 elif environment=="unsupervised":
-                    X = torch.cat((self.unsupervised["X"], self.unsupervised["psi_X"]), dim=1)
-                    self.unsupervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
-                elif environment=="all":
-                    X = torch.cat((self.supervised["X"], self.supervised["psi_X"]), dim=1)
-                    self.supervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
-                    X = torch.cat((self.unsupervised["X"], self.unsupervised["psi_X"]), dim=1)
-                    self.unsupervised["Y_hat"] = self.model.cond_exp(X.to(device)).to("cpu").squeeze()
+                    self.unsupervised["Y_hat"] = []
+                    for i in range(0, self.unsupervised["X"].shape[0], max_batch_size):
+                        batch_X = self.unsupervised["X"][i:i+max_batch_size].to(device)
+                        batch_Y_hat = self.model.cond_exp(batch_X).to("cpu").squeeze()
+                        self.unsupervised["Y_hat"].append(batch_Y_hat)
+                    self.unsupervised["Y_hat"] = torch.cat(self.unsupervised["Y_hat"], dim=0)
                 else:
                     raise ValueError(f"Environment '{environment}' not defined.")
         else:
@@ -175,6 +185,7 @@ class PPCI():
                 "PPATE": PPATE,
                 "PPATE_std": PPATE_std,
             }
+            # TODO: add structured printing
             if verbose: print(metric)
             return metric
         else:
@@ -214,7 +225,7 @@ class PPCI():
             raise ValueError(f"Environemnt '{environment}' not defined, please select between: 'supervised' and 'unsupervised'.")
         return image, Y, Y_hat, exp, frame
 
-    def visualize(self, save=True, k=6, detailed=True):
+    def visualize_frame(self, save=True, k=6, detailed=True):
         train, test = False, False
         if hasattr(self, 'supervised'):
             if ("Y_hat" in self.supervised):
@@ -228,8 +239,9 @@ class PPCI():
         ax = []
         if train: 
             # train
-            images, Ys, Y_hats, exps, frames = self.get_examples(k, environment="supervised", validation=False)
-            for i, (img, y, y_pred, exp, frame) in enumerate(zip(images, Ys, Y_hats.round(), exps, frames)):
+            clips, Ys, Y_hats, exps, frames = self.get_examples(k, environment="supervised", validation=False)
+            for i, (clip, y, y_pred, exp, frame) in enumerate(zip(clips, Ys, Y_hats.round(), exps, frames)):
+                img = clip[clip.shape[0] // 2]
                 y_pred = [int(elem.item()) for elem in y_pred.unsqueeze(-1)]
                 y = [int(elem.item()) for elem in y.unsqueeze(-1)]
                 plt.rc('font', size=8)
@@ -244,8 +256,9 @@ class PPCI():
                             xycoords=ax[0].yaxis.label, textcoords='offset points',
                             fontsize=14, ha='center', va='center', rotation=90)
             # validation
-            images, Ys, Y_hats, exps, frames = self.get_examples(k, environment="supervised", validation=True)
-            for i, (img, y, y_pred, exp, frame) in enumerate(zip(images, Ys, Y_hats.round(), exps, frames)):
+            clips, Ys, Y_hats, exps, frames = self.get_examples(k, environment="supervised", validation=True)
+            for i, (clip, y, y_pred, exp, frame) in enumerate(zip(clips, Ys, Y_hats.round(), exps, frames)):
+                img = clip[clip.shape[0] // 2]
                 y_pred = [int(elem.item()) for elem in y_pred.unsqueeze(-1)]
                 y = [int(elem.item()) for elem in y.unsqueeze(-1)]
                 plt.rc('font', size=8)
@@ -261,8 +274,9 @@ class PPCI():
                             fontsize=14, ha='center', va='center', rotation=90)
         if test:
             # test
-            images, _, Y_hats = self.get_examples(k, environment="unsupervised")
-            for i, (img, y_pred, exp, frame) in enumerate(zip(images, Y_hats.round(), exps, frames)):
+            clips, _, Y_hats = self.get_examples(k, environment="unsupervised")
+            for i, (clip, y_pred, exp, frame) in enumerate(zip(clips, Y_hats.round(), exps, frames)):
+                img = clip[clip.shape[0] // 2]
                 y_pred = [int(elem.item()) for elem in y_pred.unsqueeze(-1)]
                 plt.rc('font', size=8)
                 ax.append(fig.add_subplot(2*train+test, k, i + 2*train*k +1))
@@ -362,7 +376,7 @@ def get_tracking(dataset):
     else:
         raise ValueError("Tracking data should be a PyTorch tensor.")
 
-def load_env(environment='supervised', task="all", encoder="dino", token="class", split_criteria="experiment", generate=False, reduce_fps_factor=10, downscale_factor=1, batch_size=100, num_proc=4, data_dir="./data", background=False, verbose=False):
+def load_env(environment='supervised', task="all", encoder="dino", token="class", split_criteria="experiment", generate=False, reduce_fps_factor=10, downscale_factor=1, batch_size=100, num_proc=4, data_dir="./data", background=False, verbose=False, context=3, stride=2):
     data_env_dir = os.path.join(data_dir, environment, "background" if background else "nobackground")
     if not os.path.exists(data_env_dir):
         os.makedirs(data_env_dir)
@@ -370,28 +384,20 @@ def load_env(environment='supervised', task="all", encoder="dino", token="class"
     if not os.path.exists(os.path.join(data_env_dir, "state.json")):
         generate = True
     if generate:           
-        # features = datasets.Features({
-        #     "experiment": datasets.Value("int64"),
-        #     "position": datasets.Value("int64"),
-        #     "pos_x": datasets.Value("float32"),
-        #     "pos_y": datasets.Value("float32"),
-        #     "frame": datasets.Value("int64"),
-        #     "image": datasets.Sequence(datasets.Sequence(datasets.Sequence(datasets.Value("uint8")))),
-        #     "treatment": datasets.Value("int64"),
-        #     "outcome": datasets.Sequence(datasets.Value("float32")),
-        #     "exp_minute": datasets.Value("float32"),
-        #     "day_hour": datasets.Value("string"),
-        #     "tracking": datasets.Sequence(datasets.Value("float32")),
-        # })
         dataset = Dataset.from_generator(generator, 
-                                         gen_kwargs={"reduce_fps_factor": reduce_fps_factor, "downscale_factor": downscale_factor, "environment":environment, "background":background, "data_dir":data_dir},
-                                         #features=features,
-                                         )
+                                         gen_kwargs={"reduce_fps_factor": reduce_fps_factor, 
+                                                     "downscale_factor": downscale_factor, 
+                                                     "environment":environment, 
+                                                     "background":background, 
+                                                     "data_dir":data_dir,
+                                                     "context":context,
+                                                     "stride":stride},
+                                         num_proc=num_proc,)
         dataset.save_to_disk(data_env_dir)
         if verbose: print("Data generated and saved correctly.")
     else:
         dataset = Dataset.load_from_disk(data_env_dir)
-    dataset.set_format(type="torch", columns=["image", "treatment", "outcome", 'pos_x', 'pos_y', 'exp_minute', 'day_hour', 'frame', "experiment", "position", "tracking"], output_all_columns=True)
+    dataset.set_format(type="torch", columns=["clip", "treatment", "outcome", 'pos_x', 'pos_y', 'exp_minute', 'day_hour', 'frame', "experiment", "position", "tracking"], output_all_columns=True)
     dataset.environment = environment
     W = get_covariates(dataset)
     if ('v1' in data_dir) or ('v2' in data_dir):
@@ -400,22 +406,26 @@ def load_env(environment='supervised', task="all", encoder="dino", token="class"
         E = (9*exp_id + pos_id).to(torch.int64)
     else:
         raise ValueError(f"Unknown 'environment' definition for dataset: {data_env_dir}")
+    X = torch.cat([get_embeddings(dataset, encoder, batch_size=batch_size, num_proc=num_proc, data_dir=data_env_dir, token=token, verbose=verbose), 
+                        get_tracking(dataset)], 
+                        dim=-1)
+    X.token = token
+    X.encoder_name = encoder
     dataset_dict = {
         "source_data": dataset,
-        "X": get_embeddings(dataset, encoder, batch_size=batch_size, num_proc=num_proc, data_dir=data_env_dir, token=token, verbose=verbose),
+        "X": X,
         "Y": get_outcome(dataset, task=task),
         "split": get_split(dataset, split_criteria=split_criteria),
         "W": W, 
         "E": E,
         "T": dataset["treatment"],
-        "psi_X": get_tracking(dataset),
     }
     if verbose: 
         print("Training Environments: ", np.unique(E[dataset_dict["split"]]))
         print("Validation Environments: ", np.unique(E[~dataset_dict["split"]]))
     return dataset_dict
 
-def generator(reduce_fps_factor, downscale_factor, environment='supervised', background=False, data_dir="./data"):
+def generator(reduce_fps_factor, downscale_factor, environment='supervised', background=False, data_dir="./data", context=3, stride=2):
     if environment == 'supervised':
         start_frame_column = 'Starting Frame'
         end_frame_column = 'End Frame Annotation'
@@ -442,15 +452,17 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', bac
             pos_x = settings[settings.Experiment == f'{exp}{pos}']["Position X"].values[0]
             pos_y = settings[settings.Experiment == f'{exp}{pos}']["Position Y"].values[0]
 
-            # load file .mkv
-            frames = load_frames(exp, pos, 
-                                 reduce_fps_factor=reduce_fps_factor, 
-                                 downscale_factor=downscale_factor, 
-                                 start_frame=int(start_frame/reduce_fps_factor), 
-                                 end_frame=int(end_frame/reduce_fps_factor),
-                                 data_dir=data_dir,
-                                 background=background)
-            print(f"Frames shape: {len(frames)}", flush=True)
+            # load clips
+            clips = load_clips(exp, pos,
+                               reduce_fps_factor=reduce_fps_factor, 
+                               downscale_factor=downscale_factor, 
+                               start_frame=start_frame, 
+                               end_frame=end_frame,
+                               data_dir=data_dir,
+                               background=background,
+                               context=context,
+                               stride=stride)
+            print(f"Clips shape: {clips.shape}", flush=True)
             # load annotations
             labels = load_labels(exp, pos, 
                                  reduce_fps_factor=reduce_fps_factor,
@@ -463,12 +475,10 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', bac
                                     reduce_fps_factor=reduce_fps_factor, 
                                     start_frame=start_frame, 
                                     end_frame=end_frame,
+                                    context=context,
+                                    stride=stride,
                                     data_dir=data_dir)
             print(f"Tracking shape: {tracking.shape}", flush=True)
-            # print("Frames: ", len(frames))
-            # print("Labels: ", labels.shape)
-            # print("Start frame: ", start_frame)
-            # print("End frame: ", end_frame)
             for i in range(int((end_frame-start_frame)/reduce_fps_factor)):
                 yield {
                     "experiment": id_exp,
@@ -476,12 +486,12 @@ def generator(reduce_fps_factor, downscale_factor, environment='supervised', bac
                     "pos_x": pos_x, # covariate                          
                     "pos_y": pos_y, # covariate   
                     "frame": i,
-                    "image": frames[i],
+                    "clip": clips[i],
                     "treatment": treatment,
                     "outcome": labels[i,:],
                     "exp_minute": ((start_frame+i)/fps)//60, # covariate   
                     "day_hour": day_hour, # covariate   
-                    "tracking": tracking[i,:], 
+                    "tracking": tracking[i], 
                 }
 
 def map_behaviour_to_label(behaviour):
@@ -515,11 +525,41 @@ def load_labels(exp, pos, reduce_fps_factor, start_frame, end_frame, data_dir):
             labels.append(label_frame(i*reduce_fps_factor, behaviors))
         return torch.tensor(labels, dtype=torch.float32) # tensor Nx2
     
-def load_tracking(exp, pos, reduce_fps_factor, start_frame, end_frame, data_dir="./data"):
+# def load_tracking(exp, pos, reduce_fps_factor, start_frame, end_frame, data_dir="./data"):
+#     tracking_path = os.path.join(data_dir, f"tracking/position/{exp}{pos}.csv")
+#     tracking = pd.read_csv(tracking_path, engine='python', index_col=0)
+#     tracking_filtered = tracking.iloc[start_frame:end_frame:reduce_fps_factor, :]
+#     return torch.tensor(tracking_filtered.values, dtype=torch.float32) # tensor Nx16
+
+def load_tracking(exp, pos, reduce_fps_factor, start_frame, end_frame, context=3, stride=2, data_dir="./data"):
     tracking_path = os.path.join(data_dir, f"tracking/position/{exp}{pos}.csv")
     tracking = pd.read_csv(tracking_path, engine='python', index_col=0)
-    tracking_filtered = tracking.iloc[start_frame:end_frame:reduce_fps_factor, :]
-    return torch.tensor(tracking_filtered.values, dtype=torch.float32) # tensor Nx16
+    tracking = tracking.iloc[start_frame:end_frame].reset_index(drop=True)
+
+    num_frames, num_features = tracking.shape
+    window_size = 2 * context + 1
+    windows = []
+
+    center_indices = list(range(0, num_frames, reduce_fps_factor))
+
+    for center in center_indices:
+        start_idx = center - context
+        end_idx = center + context + 1
+        pad_left = max(0, -start_idx)
+        pad_right = max(0, end_idx - num_frames)
+        start_idx_clamped = max(0, start_idx)
+        end_idx_clamped = min(num_frames, end_idx)
+        window = tracking.iloc[start_idx_clamped:end_idx_clamped].values
+        if pad_left > 0:
+            pad_vals = np.repeat(window[0:1], pad_left, axis=0)
+            window = np.vstack((pad_vals, window))
+        if pad_right > 0:
+            pad_vals = np.repeat(window[-1:], pad_right, axis=0)
+            window = np.vstack((window, pad_vals))
+        windows.append(window)
+
+    tracking_tensor = torch.tensor(np.stack(windows), dtype=torch.float32) # [N, 2*context+1, D]
+    return tracking_tensor
 
 def load_frames(exp, pos, reduce_fps_factor, downscale_factor, start_frame, end_frame, data_dir="./data", background=False):
     if background:
@@ -551,3 +591,37 @@ def load_frames(exp, pos, reduce_fps_factor, downscale_factor, start_frame, end_
 
     cap.release()
     return frames[start_frame:end_frame]
+
+def load_clips(exp, pos, reduce_fps_factor, downscale_factor, start_frame, end_frame,
+               data_dir="./data", background=False, context=0, stride=1):
+    if background:
+        video_name = f'background/focal/{exp}{pos}.mp4'
+    else:
+        video_name = f'nobackground/focal/{exp}{pos}.mp4'
+    video_path = os.path.join(data_dir, "tracking", video_name)
+
+    cap = cv2.VideoCapture(video_path)
+    total_high_fps = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    central_indices = list(range(start_frame, end_frame, reduce_fps_factor))
+    clips = []
+    for center_idx in central_indices:
+        clip_indices = list(range(center_idx - context*stride, center_idx + context*stride + 1, stride))
+        clip_indices = [max(0, min(i, total_high_fps - 1)) for i in clip_indices]
+
+        clip_frames = []
+        for idx in clip_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                raise RuntimeError(f"Failed to read frame {idx} from video.")
+
+            if downscale_factor < 1:
+                frame = cv2.resize(frame, (0, 0), fx=downscale_factor, fy=downscale_factor)
+            tensor_frame = torch.from_numpy(frame).permute(2, 0, 1)[[2, 1, 0], :, :]  # BGR to RGB
+            clip_frames.append(tensor_frame)
+
+        clips.append(torch.stack(clip_frames))  # (2*context+1, C, H, W)
+
+    cap.release()
+    return torch.stack(clips)  # (N, 2*context+1, C, H, W)
