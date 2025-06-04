@@ -63,7 +63,7 @@ def get_embeddings(data, encoder_name, batch_size=100, num_proc=4, data_dir="./d
         )
         embeddings = []
         for batch in tqdm(dataloader):
-            embedding = encoder(batch["image"], model, processor, device, token)
+            embedding = encoder(batch["clip"], model, processor, device, token)
             embeddings.append(embedding)
         embeddings = torch.cat(embeddings, 0)
         embeddings = Dataset.from_dict({encoder_name: embeddings.tolist()})
@@ -84,66 +84,206 @@ def get_embeddings(data, encoder_name, batch_size=100, num_proc=4, data_dir="./d
     return X
 
 def encoder(x, model, processor, device, token="class"):
+
+    B, T, C, H, W = x.shape
+    x = x.to(device)
+    x = x.view(B * T, C, H, W)
+
     inputs = processor(images=x, return_tensors="pt").to(device)
     outputs = model(**inputs, output_hidden_states=True)
     encoder_name_full = model.config._name_or_path
+
     if ("vit" in encoder_name_full) or ("dino" in encoder_name_full) or ("siglip" in encoder_name_full):
-        if token=="class":
-            emb = outputs.hidden_states[-1][:, 0]
-        elif token=="mean":
-            emb = outputs.hidden_states[-1][:,1:].mean(dim=1)
+        if token == "class":
+            emb = outputs.hidden_states[-1][:, 0]  # (B*T, D)
+        elif token == "mean":
+            emb = outputs.hidden_states[-1][:, 1:].mean(dim=1)  # (B*T, D)
         else:
             raise ValueError("Token criteria not recognized. Please select between: 'class', 'mean'.")
     elif ("resnet" in encoder_name_full):
-        emb = outputs.hidden_states[-1].mean(dim=[2,3])
+        emb = outputs.hidden_states[-1].mean(dim=[2, 3])  # (B*T, D)
     else:
-        raise ValueError(f"Unkown model class: {encoder_name_full}")
-    return emb.to("cpu")
+        raise ValueError(f"Unknown model class: {encoder_name_full}")
 
-class MLP(nn.Module):
-    def __init__(self, input_size, hidden_nodes, hidden_layers, task, psi_dim=16):
+    return emb.view(B, T, -1).to("cpu")
+
+def get_output_size(task):
+    if task == "all":
+        return 2  # Double Binary classification
+    elif task == "sum":
+        return 3  # Three classes [0, 1, 2]
+    elif task in ["blue", "yellow", "or"]:
+        return 1  # Single class (e.g., binary classification)
+    else:
+        raise ValueError(f"Task '{task}' is not recognized. Choose from 'all', 'sum', 'blue', 'yellow', or 'or'.")
+
+def get_classifier(cls_name, task, emb_size=768, num_frames=7, hidden_nodes=128, kernel_size=3):  
+    if cls_name=="Transformer":
+        return ViVit(task=task,
+                     emb_size=emb_size, 
+                     num_frames=num_frames,
+                     hidden_nodes=hidden_nodes, #128
+                     )
+    elif cls_name=="ConvNet":
+        return TemporalConv(task=task, 
+                            emb_size=emb_size, 
+                            filters=hidden_nodes, #128
+                            kernel_size=kernel_size,
+                            )
+    elif cls_name=="MLP":
+        return MLP(task=task, 
+                   emb_size=emb_size, 
+                   hidden_nodes=hidden_nodes, #128
+                   )
+
+class ViVit(nn.Module):
+    def __init__(self, task, emb_size=768, num_frames=7, hidden_nodes=128):
         super().__init__()
         self.task = task
-        if task=="all":
-            output_size = 2
-        elif task=="sum":
-            output_size = 3
-        else:
-            output_size = 1
-        self.output_size = output_size
-        self.psi_dim = psi_dim
+        self.output_size = get_output_size(task)
 
-        # featurizer
-        self.featurizer = nn.Sequential(
-            nn.Linear(input_size-psi_dim, 100),
-            nn.ReLU(),
-            nn.Linear(100, psi_dim),
-            nn.ReLU()
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size))
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, num_frames + 1, emb_size), requires_grad=False
         )
-        # head
-        layers = []
-        layers.append(nn.Linear(2*psi_dim, psi_dim))
-        layers.append(nn.ReLU())
-        for _ in range(hidden_layers):
-            layers.append(nn.Linear(psi_dim, psi_dim))
-            layers.append(nn.ReLU())
-        layers.append(nn.Linear(psi_dim, output_size))
-        self.head = nn.Sequential(*layers)
 
-        self.init_weights() # check if works
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=emb_size,
+            nhead=4,
+            dim_feedforward=512,
+            dropout=0.2,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+        self.head = nn.Sequential(
+            nn.Linear(emb_size, hidden_nodes), # [B, D] --> [B, H]
+            nn.ReLU(),
+            nn.Linear(hidden_nodes, hidden_nodes//4), # [B, H] --> [B, H//4]
+            nn.ReLU(),
+            nn.Linear(hidden_nodes//4, self.output_size)  # Binary classification (logit output)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.TransformerEncoderLayer):
+                nn.init.xavier_uniform_(m.self_attn.in_proj_weight)
+                if m.self_attn.in_proj_bias is not None:
+                    nn.init.constant_(m.self_attn.in_proj_bias, 0.0)
+                nn.init.xavier_uniform_(m.linear1.weight)
+                if m.linear1.bias is not None:
+                    nn.init.constant_(m.linear1.bias, 0.0)
+                nn.init.xavier_uniform_(m.linear2.weight)
+                if m.linear2.bias is not None:
+                    nn.init.constant_(m.linear2.bias, 0.0)
+
+    def forward(self, x):
+        B, T, D = x.shape  # x: [B, T, D]
+        cls_tokens = self.cls_token.expand(B, 1, D)  # [B, 1, D]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, T+1, D]
+        x = x + self.pos_embed[:, :T + 1]  # Add positional encoding [B, T+1, D]
+        x = self.transformer(x)  # [B, T+1, D]
+        return self.head(x[:, 0]) # [B, D] → [B, O] e.g. O=2 --> [-1.8, 0.4]
+    
+    def probs(self, X):
+        if self.task=="sum":
+            return self.forward(X).softmax(dim=-1) # [0.7, 0.1, 0.2]
+        else:
+            return self.forward(X).sigmoid() # [0.8, 0.4]
+    def pred(self, X):
+        if self.task=="sum":
+            return torch.argmax(self.forward(X), dim=-1) # [0]
+        else:
+            return self.probs(X).round() # [1, 0]
+    def cond_exp(self, X):
+        if self.task=="sum":
+            values = torch.tensor(range(3)).float().to(self.device)
+            probs = self.probs(X)
+            return torch.matmul(probs, values) # [0.5]
+        else:
+            return self.probs(X) # [0.8, 0.4]
         
-    def init_weights(self):
+class TemporalConv(nn.Module):
+    def __init__(self, task, emb_size=768, filters=128, kernel_size=3):
+        super().__init__()
+        self.task = task
+        self.output_size = get_output_size(task)
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(emb_size, filters, kernel_size=kernel_size, padding=0), # [B, D, T] --> [B, F, T-2]
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1), # [B, F, T-2] --> [B, F, 1]
+            nn.Flatten(), # [B, F, 1] --> [B, F]
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(filters, filters//4), # [B, F] --> [B, F//4]
+            nn.ReLU(),
+            nn.Linear(filters//4, self.output_size)  # [B, F//4] --> [B, O] Binary classification (logit output)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        x = x.transpose(1, 2) # [B, T, D] --> [B, D, T]
+        x = self.encoder(x)  # [B, F]
+        return self.head(x) # [B, F] e.g. O=2 --> [-1.8, 0.4]
+    
+    def probs(self, X):
+        if self.task=="sum":
+            return self.forward(X).softmax(dim=-1) # [0.7, 0.1, 0.2]
+        else:
+            return self.forward(X).sigmoid() # [0.8, 0.4]
+    def pred(self, X):
+        if self.task=="sum":
+            return torch.argmax(self.forward(X), dim=-1) # [0]
+        else:
+            return self.probs(X).round() # [1, 0]
+    def cond_exp(self, X):
+        if self.task=="sum":
+            values = torch.tensor(range(3)).float().to(self.device)
+            probs = self.probs(X)
+            return torch.matmul(probs, values) # [0.5]
+        else:
+            return self.probs(X) # [0.8, 0.4]
+
+class MLP(nn.Module):
+    def __init__(self, task, emb_size=768, hidden_nodes=128):
+        super().__init__()
+        self.task = task
+        self.output_size = get_output_size(task)
+
+        self.encoder = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1), # [B, D, T] --> [B, D, 1]
+            nn.Flatten(), # [B, D, 1] --> [B, D]
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(emb_size, hidden_nodes), # [B, D] --> [B, H]
+            nn.ReLU(),
+            nn.Linear(hidden_nodes, hidden_nodes//4), # [B, H] --> [B, H//4]
+            nn.ReLU(),
+            nn.Linear(hidden_nodes//4, self.output_size)  # [B, H//4] --> [B, O] Binary classification (logit output)
+        )
+
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, X):
-        frame_emb = X[:, :-self.psi_dim] 
-        track = X[:, -self.psi_dim:] 
-        self.representation = torch.cat((self.featurizer(frame_emb), track), 
-                                   dim=-1) 
-        return self.head(self.representation) # [-1.8, 0.4]
+    def forward(self, x):
+        x = x.transpose(1, 2) # [B, T, D] --> [B, D, T]
+        x = self.encoder(x)  # [B, D]
+        return self.head(x) # [B, O] e.g. O=2 --> [-1.8, 0.4]
     
     def probs(self, X):
         if self.task=="sum":
