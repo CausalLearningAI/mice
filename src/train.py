@@ -1,14 +1,15 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from copy import deepcopy
-from model import MLP
+from model import get_classifier
 import numpy as np
+from utils import get_model_size
 
-def train_(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 512, hidden_layers = 1, lr=0.0001, verbose=True, decondounded=False, gpu=True, cfl=0):
+def train_(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 128, lr=0.0001, verbose=True, decondounded=False, gpu=True, cfl=0, cls_name="Transformer"):
     device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
     if verbose: print(f"Device: {device}")
     N = supervised["T"].shape[0]
-    X = torch.cat((supervised["X"], supervised["psi_X"]), dim=1)
+    X = supervised["X"]
     y = supervised["Y"].float()
     t = supervised["T"].float()-1
     E = supervised["E"]
@@ -54,12 +55,10 @@ def train_(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 512, hidde
                               shuffle=True)
 
     # get model
-    input_size = X.shape[1]
-    model = MLP(input_size, hidden_nodes, hidden_layers, task=task).to(device)
+    num_frames, emb_size = X.shape[1], X.shape[2]
+    model = get_classifier(cls_name, task, emb_size=emb_size, num_frames=num_frames, hidden_nodes=hidden_nodes, kernel_size=3).to(device)
     model.device = device
     model.task = task
-    model.token = supervised["X"].token
-    model.encoder = supervised["X"].encoder_name
     if task == "sum":
         if decondounded:
             loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
@@ -125,12 +124,12 @@ def train_(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 512, hidde
 
     return best_model
 
-def train_md(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 256, hidden_layers = 1, lr=0.0001, verbose=True, ic_weight=1, gpu=True, cfl=0, method="vREx"):
+def train_md(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 256, lr=0.0001, verbose=True, ic_weight=1, gpu=True, cfl=0, method="vREx", cls_name="Transformer"):
     device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
     if verbose: print(f"Device: {device}")
 
     # get training and validation set
-    X = torch.cat((supervised["X"], supervised["psi_X"]), dim=1)
+    X = supervised["X"]
     y = supervised["Y"].float()
     t = supervised["T"].float()-1
     E = supervised["E"]
@@ -166,12 +165,10 @@ def train_md(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 256, hid
         y_val.task = task
 
     # get model
-    input_size = X.shape[1]
-    model = MLP(input_size, hidden_nodes=hidden_nodes, hidden_layers=hidden_layers, task=task).to(device)
+    num_frames, emb_size = X.shape[1], X.shape[2]
+    model = get_classifier(cls_name, task, emb_size=emb_size, num_frames=num_frames, hidden_nodes=hidden_nodes, kernel_size=3).to(device)
     model.device = device
     model.task = task
-    model.token = supervised["X"].token
-    model.encoder = supervised["X"].encoder_name
     if y.task == "sum":
         loss_fn = torch.nn.CrossEntropyLoss()
     else:
