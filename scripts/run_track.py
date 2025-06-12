@@ -1,10 +1,15 @@
 import cv2
 import numpy as np
 import pandas as pd
+from collections import deque
 from scipy.spatial.distance import cdist
 
 import argparse
 import os
+import sys
+sys.path.append('./src')
+import warnings
+warnings.filterwarnings("ignore")
 import time
 from utils import get_time
 
@@ -132,6 +137,62 @@ def zoom(frame, centroid, radius=70):
 
     return zoomed_frame
 
+# class KalmanFilter2D:
+#     def __init__(self, dt=1.0):
+#         self.kf = cv2.KalmanFilter(4, 2)  # 4 state variables: x, y, dx, dy; 2 measurements: x, y
+#         self.dt = dt
+
+#         # State transition matrix (incorporates velocity over time dt)
+#         self.kf.transitionMatrix = np.array([[1, 0, dt, 0],
+#                                              [0, 1, 0, dt],
+#                                              [0, 0, 1,  0],
+#                                              [0, 0, 0,  1]], np.float32)
+
+#         # Measurement matrix (we directly observe x, y)
+#         self.kf.measurementMatrix = np.array([[1, 0, 0, 0],
+#                                               [0, 1, 0, 0]], np.float32)
+
+#         # Covariance matrices
+#         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03  # Model noise
+#         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0  # Observation noise
+
+#         self.initialized = False
+
+#     def update(self, coord):
+#         if coord is not None:
+#             measured = np.array([[np.float32(coord[0])],
+#                                  [np.float32(coord[1])]])
+#             if not self.initialized:
+#                 # Initialize state: position + zero velocity
+#                 self.kf.statePre = np.array([[coord[0]], [coord[1]], [0], [0]], dtype=np.float32)
+#                 self.kf.statePost = np.array([[coord[0]], [coord[1]], [0], [0]], dtype=np.float32)
+#                 self.initialized = True
+#             self.kf.correct(measured)
+#         pred = self.kf.predict()
+#         return (int(pred[0]), int(pred[1]))
+
+class RollingVelocitySmoother:
+    # Simple moving average smoother for velocity estimation.
+    def __init__(self, window=5):
+        self.prev_pos = None
+        self.vel_buffer = deque(maxlen=window)
+
+    def update(self, pos):
+        if self.prev_pos is None:
+            self.prev_pos = pos
+            return (0.0, 0.0)
+        
+        dx = pos[0] - self.prev_pos[0]
+        dy = pos[1] - self.prev_pos[1]
+        self.vel_buffer.append((dx, dy))
+        self.prev_pos = pos
+
+        # Compute mean dx and dy
+        mean_dx = np.mean([v[0] for v in self.vel_buffer])
+        mean_dy = np.mean([v[1] for v in self.vel_buffer])
+
+        return (mean_dx, mean_dy)
+
 def main(args):
     # === Load video ===
     video_dir = os.path.join(args.data_dir, "video")
@@ -213,6 +274,10 @@ def main(args):
         ants_centroids = [(0, 0), (500, 500), (1000, 1000)]
         yellow_index = 1
         blue_index = 2
+
+        blue_v_smoother = RollingVelocitySmoother(window=5)
+        yellow_v_smoother = RollingVelocitySmoother(window=5)
+        focal_v_smoother = RollingVelocitySmoother(window=5)
 
         while True:
             ret, frame = cap.read()
@@ -299,21 +364,21 @@ def main(args):
                 Y2F = 1
             
             # Save tracking data
-            if frame_num==0:
-                blue_x_old, blue_y_old = ants_centroids[blue_index]
-                yellow_x_old, yellow_y_old = ants_centroids[yellow_index]
-                focal_x_old, focal_y_old = ants_centroids[focal_index]
             blue_x, blue_y = ants_centroids[blue_index]
             yellow_x, yellow_y = ants_centroids[yellow_index]
             focal_x, focal_y = ants_centroids[focal_index]
+            blue_vx, blue_vy = blue_v_smoother.update((blue_x, blue_y))
+            yellow_vx, yellow_vy = yellow_v_smoother.update((yellow_x, yellow_y))
+            focal_vx, focal_vy = focal_v_smoother.update((focal_x, focal_y))
+            
             tracked_data.append({
                 "frame": frame_num,
                 "blue_x": blue_x, "blue_y": blue_y,
                 "yellow_x": yellow_x, "yellow_y": yellow_y,
                 "focal_x": focal_x, "focal_y": focal_y,
-                "blue_vx": (blue_x - blue_x_old), "blue_vy": (blue_y - blue_y_old),
-                "yellow_vx": (yellow_x - yellow_x_old), "yellow_vy": (yellow_y - yellow_y_old),
-                "focal_vx": (focal_x - focal_x_old), "focal_vy": (focal_y - focal_y_old),
+                "blue_vx": blue_vx, "blue_vy": blue_vy,
+                "yellow_vx": yellow_vx, "yellow_vy": yellow_vy,
+                "focal_vx": focal_vx, "focal_vy": focal_vy,
                 "missing_blue": missing_blue, "missing_yellow": missing_yellow,
                 "B2F": B2F, "Y2F": Y2F,
             })
@@ -325,29 +390,25 @@ def main(args):
                 cv2.circle(frame_tracking, (int(ants_centroids[index][0]), int(ants_centroids[index][1])), 5, color_map[color], -1)
             cv2.arrowedLine(frame_tracking, 
                             (int(blue_x), int(blue_y)), 
-                            (int(blue_x + 10 * (blue_x - blue_x_old)), int(blue_y + 10 * (blue_y - blue_y_old))), 
+                            (int(blue_x + 10 * (blue_vx)), int(blue_y + 10 * (blue_vy))), 
                             color_map["blue"], 2)
             cv2.arrowedLine(frame_tracking, 
                             (int(yellow_x), int(yellow_y)), 
-                            (int(yellow_x + 10 * (yellow_x - yellow_x_old)), int(yellow_y + 10 * (yellow_y - yellow_y_old))), 
+                            (int(yellow_x + 10 * (yellow_vx)), int(yellow_y + 10 * (yellow_vy))), 
                             color_map["yellow"], 2)
             cv2.arrowedLine(frame_tracking, 
                             (int(focal_x), int(focal_y)), 
-                            (int(focal_x + 10 * (focal_x - focal_x_old)), int(focal_y + 10 * (focal_y - focal_y_old))), 
+                            (int(focal_x + 10 * (focal_vx)), int(focal_y + 10 * (focal_vy))), 
                             color_map["green"], 2)
-            
-            blue_x_old, blue_y_old = blue_x, blue_y
-            yellow_x_old, yellow_y_old = yellow_x, yellow_y
-            focal_x_old, focal_y_old = focal_x, focal_y
             
             # Write the frame to the output video
             tracking.write(frame_tracking)
-            zoom_blue_b.write(zoom(frame, ants_centroids[blue_index], args.radius))
-            zoom_yellow_b.write(zoom(frame, ants_centroids[yellow_index], args.radius))
-            zoom_focal_b.write(zoom(frame, ants_centroids[focal_index], args.radius))
-            zoom_blue_nb.write(zoom(frame_noback, ants_centroids[blue_index], args.radius))
-            zoom_yellow_nb.write(zoom(frame_noback, ants_centroids[yellow_index], args.radius))
-            zoom_focal_nb.write(zoom(frame_noback, ants_centroids[focal_index], args.radius))
+            zoom_blue_b.write(zoom(frame, [blue_x, blue_y], args.radius))
+            zoom_yellow_b.write(zoom(frame, [yellow_x, yellow_y], args.radius))
+            zoom_focal_b.write(zoom(frame, [focal_x, focal_y], args.radius))
+            zoom_blue_nb.write(zoom(frame_noback, [blue_x, blue_y], args.radius))
+            zoom_yellow_nb.write(zoom(frame_noback, [yellow_x, yellow_y], args.radius))
+            zoom_focal_nb.write(zoom(frame_noback, [focal_x, focal_y], args.radius))
 
             frame_num += 1
 
