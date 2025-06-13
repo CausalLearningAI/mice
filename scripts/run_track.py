@@ -11,14 +11,15 @@ sys.path.append('./src')
 import warnings
 warnings.filterwarnings("ignore")
 import time
-from utils import get_time
+from utils import get_time, angle_between
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Track ants in a video.")
     parser.add_argument("--data_dir", type=str, default="data/v2/", help="Data directory.")
     parser.add_argument("--verbose", default=False, action="store_true", help="Enable verbose output.")
     parser.add_argument("--radius", type=int, default=70, help="Radius for zooming in on ants.")
-    parser.add_argument("--proximity_dist", type=int, default=80, help="Proximity distance to define potential interaction.")
+    parser.add_argument("--window", type=int, default=5, help="Window size for velocity smoothing.")
+    parser.add_argument("--min_speed", type=float, default=3.0, help="Minimum speed for tracking ants.")
     parser.add_argument("--max_step", type=int, default=500, help="Maximum step distance for tracking.")
     return parser
 
@@ -267,19 +268,27 @@ def main(args):
             "white": (255, 255, 255),
             "orange": (0, 165, 255),
             "skyblue": (255, 255, 0),
+            "black": (0, 0, 0),
         }
 
         # Inizialization
         # TODO: get the initial positions of the blue and yellow dots
         ants_centroids = [(0, 0), (500, 500), (1000, 1000)]
+        ants_norms = [(0, 0), (0, 0), (0, 0)]
         yellow_index = 1
         blue_index = 2
+        blue_nx, blue_ny = 0, 0
+        yellow_nx, yellow_ny = 0, 0
+        focal_nx, focal_ny = 0, 0
+        blue_vx_main, blue_vy_main = 0, 0
+        yellow_vx_main, yellow_vy_main = 0, 0
+        focal_vx_main, focal_vy_main = 0, 0
 
-        blue_v_smoother = RollingVelocitySmoother(window=5)
-        yellow_v_smoother = RollingVelocitySmoother(window=5)
-        focal_v_smoother = RollingVelocitySmoother(window=5)
+        blue_v_smoother = RollingVelocitySmoother(window=args.window)
+        yellow_v_smoother = RollingVelocitySmoother(window=args.window)
+        focal_v_smoother = RollingVelocitySmoother(window=args.window)
 
-        while True:
+        while True: # and frame_num < 1000:
             ret, frame = cap.read()
             if not ret:
                 break
@@ -313,36 +322,36 @@ def main(args):
             if args.verbose: print(f"Frame {frame_num}: Blue: {blue_centroid}, Yellow: {yellow_centroid}", flush=True)
             
             # 2. Get ants positions
-            Y2F, B2F = 0, 0
             frame_noback_gray = cv2.cvtColor(frame_noback, cv2.COLOR_BGR2GRAY)
             _, threshold = cv2.threshold(frame_noback_gray, np.percentile(frame_noback_gray, 99.5), 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 100]
             filtered_contours = sorted(filtered_contours, key=cv2.contourArea, reverse=True)
             centroids = []
+            norms = []
             for cnt in filtered_contours:
                 M = cv2.moments(cnt)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    centroids.append((cx, cy))
+                    centroids.append((cx, cy))  
+                    mean, eigenvectors, eigenvalues = cv2.PCACompute2(cnt.reshape(-1, 2).astype(np.float32), 
+                                                                      mean=np.array([]))
+                    norms.append(eigenvectors[0])                            
             ants_centroids_new = merge_close_centroids(centroids)
             if args.verbose: print(f"Frame {frame_num}: Ants centroids (new): {ants_centroids_new}", flush=True)
             if len(ants_centroids_new)<1:
                 print("Not ants detect.", flush=True)
             elif len(ants_centroids_new)==1:
-                Y2F, B2F = 1, 1
+                pass
             elif len(ants_centroids_new)==2:
                 isolated_centroid = ants_centroids_new[1]
                 isolated_distances = cdist([isolated_centroid], ants_centroids)
                 isolated_index = np.argmin(isolated_distances)
                 ants_centroids[isolated_index] = isolated_centroid
-                if isolated_index == blue_index:
-                    Y2F = 1
-                elif isolated_index == yellow_index:
-                    B2F = 1
             else:
                 ants_centroids = ants_centroids_new[:3]
+                ants_norms = norms[:3]
 
             # 3. Identify ants
             if args.verbose: print(f"Frame {frame_num}: Ants centroids: {ants_centroids}", flush=True)
@@ -358,18 +367,39 @@ def main(args):
                 else:
                     blue_index = np.argsort(blue_distances[0])[1]
             focal_index = 3-(blue_index+yellow_index)
-            if cdist([ants_centroids[blue_index]], [ants_centroids[focal_index]])[0][0] < args.proximity_dist:
-                B2F = 1
-            if cdist([ants_centroids[yellow_index]], [ants_centroids[focal_index]])[0][0] < args.proximity_dist:
-                Y2F = 1
+            dist_B2F = cdist([ants_centroids[blue_index]], [ants_centroids[focal_index]])[0][0]
+            dist_Y2F = cdist([ants_centroids[yellow_index]], [ants_centroids[focal_index]])[0][0]
+            dist_B2Y = cdist([ants_centroids[blue_index]], [ants_centroids[yellow_index]])[0][0]
             
             # Save tracking data
             blue_x, blue_y = ants_centroids[blue_index]
             yellow_x, yellow_y = ants_centroids[yellow_index]
             focal_x, focal_y = ants_centroids[focal_index]
+
             blue_vx, blue_vy = blue_v_smoother.update((blue_x, blue_y))
             yellow_vx, yellow_vy = yellow_v_smoother.update((yellow_x, yellow_y))
             focal_vx, focal_vy = focal_v_smoother.update((focal_x, focal_y))
+            
+            if np.linalg.norm([blue_vx, blue_vy]) > args.min_speed:
+                blue_vx_main, blue_vy_main = blue_vx, blue_vy
+            if np.linalg.norm([yellow_vx, yellow_vy]) > args.min_speed:
+                yellow_vx_main, yellow_vy_main = yellow_vx, yellow_vy
+            if np.linalg.norm([focal_vx, focal_vy]) > args.min_speed:
+                focal_vx_main, focal_vy_main = focal_vx, focal_vy
+
+            blue_nx, blue_ny = ants_norms[blue_index]
+            if np.dot([blue_nx, blue_ny], [blue_vx_main, blue_vy_main]) < 0:
+                blue_nx, blue_ny = -blue_nx, -blue_ny
+            yellow_nx, yellow_ny = ants_norms[yellow_index]
+            if np.dot([yellow_nx, yellow_ny], [yellow_vx_main, yellow_vy_main]) < 0:
+                yellow_nx, yellow_ny = -yellow_nx, -yellow_ny
+            focal_nx, focal_ny = ants_norms[focal_index]
+            if np.dot([focal_nx, focal_ny], [focal_vx_main, focal_vy_main]) < 0:
+                focal_nx, focal_ny = -focal_nx, -focal_ny
+
+            angle_B2F = angle_between(blue_nx, blue_ny, focal_nx, focal_ny)
+            angle_Y2F = angle_between(yellow_nx, yellow_ny, focal_nx, focal_ny)
+            angle_B2Y = angle_between(blue_nx, blue_ny, yellow_nx, yellow_ny)
             
             tracked_data.append({
                 "frame": frame_num,
@@ -379,8 +409,9 @@ def main(args):
                 "blue_vx": blue_vx, "blue_vy": blue_vy,
                 "yellow_vx": yellow_vx, "yellow_vy": yellow_vy,
                 "focal_vx": focal_vx, "focal_vy": focal_vy,
-                "missing_blue": missing_blue, "missing_yellow": missing_yellow,
-                "B2F": B2F, "Y2F": Y2F,
+                "dist_B2F": dist_B2F, "dist_Y2F": dist_Y2F, "dist_B2Y": dist_B2Y,
+                "angle_B2F": angle_B2F, "angle_Y2F": angle_Y2F, "angle_B2Y": angle_B2Y,
+                #"missing_blue": missing_blue, "missing_yellow": missing_yellow,
             })
             
             # Color marking
@@ -400,6 +431,18 @@ def main(args):
                             (int(focal_x), int(focal_y)), 
                             (int(focal_x + 10 * (focal_vx)), int(focal_y + 10 * (focal_vy))), 
                             color_map["green"], 2)
+            cv2.arrowedLine(frame_tracking,
+                            (int(blue_x), int(blue_y)), 
+                            (int(blue_x + 30 * (blue_nx)), int(blue_y + 30 * (blue_ny))), 
+                            color_map["white"], 2)
+            cv2.arrowedLine(frame_tracking,
+                            (int(yellow_x), int(yellow_y)), 
+                            (int(yellow_x + 30 * (yellow_nx)), int(yellow_y + 30 * (yellow_ny))), 
+                            color_map["white"], 2)
+            cv2.arrowedLine(frame_tracking,
+                            (int(focal_x), int(focal_y)), 
+                            (int(focal_x + 30 * (focal_nx)), int(focal_y + 30 * (focal_ny))), 
+                            color_map["white"], 2)
             
             # Write the frame to the output video
             tracking.write(frame_tracking)

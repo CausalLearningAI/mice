@@ -407,8 +407,8 @@ def load_env(environment='supervised', task="all", encoder="dino", token="class"
     else:
         raise ValueError(f"Unknown 'environment' definition for dataset: {data_env_dir}")
     X = torch.cat([get_embeddings(dataset, encoder, batch_size=batch_size, num_proc=num_proc, data_dir=data_env_dir, token=token, verbose=verbose), 
-                        get_tracking(dataset)], 
-                        dim=-1)
+                   get_tracking(dataset)], 
+                   dim=-1)
     X.token = token
     X.encoder_name = encoder
     dataset_dict = {

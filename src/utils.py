@@ -209,3 +209,12 @@ def get_model_size(model):
         buffer_size += buffer.nelement() * buffer.element_size()
     total_size = param_size + buffer_size  # in bytes
     return total_size / (1024 ** 2)  # convert to MB
+
+def angle_between(n1x, n1y, n2x, n2y):
+    angle1 = np.arctan2(n1y, n1x)
+    angle2 = np.arctan2(n2y, n2x)
+    angle_diff = (angle2 - angle1) * 180 / np.pi
+    angle_diff = (angle_diff + 360) % 360  # Wrap to [0, 360)
+    if angle_diff > 180:
+        angle_diff = 360 - angle_diff      # Convert to [0, 180]
+    return angle_diff

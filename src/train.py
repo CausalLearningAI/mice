@@ -3,7 +3,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from copy import deepcopy
 from model import get_classifier
 import numpy as np
-from utils import get_model_size
 
 def train_(supervised, batch_size=1024, num_epochs=20, hidden_nodes = 128, lr=0.0001, verbose=True, decondounded=False, gpu=True, cfl=0, cls_name="Transformer"):
     device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")

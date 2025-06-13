@@ -149,7 +149,7 @@ class ViVit(nn.Module):
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=emb_size,
-            nhead=4,
+            nhead=6,
             dim_feedforward=512,
             dropout=0.2,
             batch_first=True
